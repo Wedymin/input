@@ -1,47 +1,65 @@
 name: Downgrade PDFs to PDF 1.4 (Acrobat 5+)
 
 on:
-  workflow_dispatch: {}     # ręczne uruchomienie z zakładki Actions
+  workflow_dispatch: {}
   push:
     paths:
-      - "input/*.pdf"       # automatycznie przy każdym nowym PDF-ie w input/
+      - "input/**.pdf"
+      - "input/**.PDF"
 
 jobs:
   convert:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout (with LFS)
         uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Show repo tree & find PDFs
+        run: |
+          echo "== Repo tree =="
+          ls -lahR || true
+          echo "== PDFs in input/ (any case) =="
+          find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print || true
 
       - name: Install Ghostscript
         run: |
           sudo apt-get update
           sudo apt-get install -y ghostscript
+          gs -v
 
-      - name: Prepare output folder
-        run: mkdir -p output
-
-      - name: Convert all PDFs from input/ to PDF 1.4
+      - name: Convert PDFs to PDF 1.4
         shell: bash
         run: |
+          set -euo pipefail
           shopt -s nullglob
-          for f in input/*.pdf; do
+          mapfile -t files < <(find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print)
+          if (( ${#files[@]} == 0 )); then
+            echo "ERROR: No PDFs found in input/"; exit 66
+          fi
+          mkdir -p output
+          for f in "${files[@]}"; do
             base="$(basename "$f")"
-            out="output/${base%.pdf}_PDF14.pdf"
-            echo "Converting: $f -> $out"
-            gs \
-              -sDEVICE=pdfwrite \
-              -dCompatibilityLevel=1.4 \
-              -dPDFSETTINGS=/prepress \
-              -dDetectDuplicateImages=true \
-              -dColorImageDownsampleType=/None \
-              -dGrayImageDownsampleType=/None \
-              -dMonoImageDownsampleType=/None \
-              -dEmbedAllFonts=true \
-              -dSubsetFonts=true \
-              -dNOPAUSE -dQUIET -dBATCH \
-              -sOutputFile="$out" "$f"
+            out="output/${base%.*}_PDF14.pdf"
+            echo "::group::Converting $f -> $out"
+            set -x
+            gs -sDEVICE=pdfwrite -dSAFER \
+               -dCompatibilityLevel=1.4 \
+               -dPDFSETTINGS=/prepress \
+               -dDetectDuplicateImages=true \
+               -dColorImageDownsampleType=/None \
+               -dGrayImageDownsampleType=/None \
+               -dMonoImageDownsampleType=/None \
+               -dEmbedAllFonts=true -dSubsetFonts=true \
+               -dNOPAUSE -dBATCH \
+               -sOutputFile="$out" "$f"
+            set +x
+            if [[ ! -s "$out" ]]; then
+              echo "ERROR: Conversion produced no file for $f"; exit 65
+            fi
+            echo "::endgroup::"
           done
 
       - name: List outputs
@@ -51,5 +69,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: converted-pdfs
-          path: output/*.pdf
-          if-no-files-found: warn
+          path: output
+          if-no-files-found: error
