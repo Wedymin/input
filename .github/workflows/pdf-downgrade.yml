@@ -1,0 +1,55 @@
+name: Downgrade PDFs to PDF 1.4 (Acrobat 5+)
+
+on:
+  workflow_dispatch: {}     # ręczne uruchomienie z zakładki Actions
+  push:
+    paths:
+      - "input/*.pdf"       # automatycznie przy każdym nowym PDF-ie w input/
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Ghostscript
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ghostscript
+
+      - name: Prepare output folder
+        run: mkdir -p output
+
+      - name: Convert all PDFs from input/ to PDF 1.4
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in input/*.pdf; do
+            base="$(basename "$f")"
+            out="output/${base%.pdf}_PDF14.pdf"
+            echo "Converting: $f -> $out"
+            gs \
+              -sDEVICE=pdfwrite \
+              -dCompatibilityLevel=1.4 \
+              -dPDFSETTINGS=/prepress \
+              -dDetectDuplicateImages=true \
+              -dColorImageDownsampleType=/None \
+              -dGrayImageDownsampleType=/None \
+              -dMonoImageDownsampleType=/None \
+              -dEmbedAllFonts=true \
+              -dSubsetFonts=true \
+              -dNOPAUSE -dQUIET -dBATCH \
+              -sOutputFile="$out" "$f"
+          done
+
+      - name: List outputs
+        run: ls -lah output || true
+
+      - name: Upload converted PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: converted-pdfs
+          path: output/*.pdf
+          if-no-files-found: warn
