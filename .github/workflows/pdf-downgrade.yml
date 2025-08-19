@@ -30,7 +30,6 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout (with LFS)
         uses: actions/checkout@v4
@@ -57,16 +56,17 @@ jobs:
       - name: Convert PDFs (GS → QPDF+GS → MuPDF+GS → Raster)
         shell: bash
         env:
-          PDFSETTINGS: ${{ github.event.inputs.pdfsettings || '/prepress' }}
-          ALLOW_RASTER: ${{ github.event.inputs.allow_raster_fallback || 'true' }}
+          PDFSETTINGS: ${{ github.event.inputs.pdfsettings && github.event.inputs.pdfsettings || '/prepress' }}
+          ALLOW_RASTER: ${{ github.event.inputs.allow_raster_fallback && github.event.inputs.allow_raster_fallback || 'true' }}
+          INPUT_PATH: ${{ github.event.inputs.path && github.event.inputs.path || '' }}
         run: |
           set -euo pipefail
           mkdir -p output logs
 
           # Zbierz pliki wejściowe
           declare -a files=()
-          if [[ -n "${{ github.event.inputs.path }}" ]]; then
-            files=( "${{ github.event.inputs.path }}" )
+          if [[ -n "$INPUT_PATH" ]]; then
+            files=( "$INPUT_PATH" )
           else
             mapfile -t files < <(find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print 2>/dev/null || true)
             if (( ${#files[@]} == 0 )); then
@@ -88,7 +88,7 @@ jobs:
             log="logs/${stem}.log"
             echo "=== Przetwarzam: $f ===" | tee "$log"
 
-            # 1) Ghostscript minimalny
+            # 1) Ghostscript
             if gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
                   -dPDFSETTINGS="${PDFSETTINGS}" \
                   -sOutputFile="$out" "$f" >>"$log" 2>&1; then
@@ -123,7 +123,7 @@ jobs:
             fi
             rm -f "$tmp2" || true
 
-            # 4) Fallback rastrowy (opcjonalny)
+            # 4) Raster fallback (opcjonalny)
             if [[ "${ALLOW_RASTER}" == "true" ]]; then
               out_raster="output/${stem}_RASTER_PDF14.pdf"
               if pdftocairo -pdf -r 300 "$f" "output/${stem}_RASTER" >>"$log" 2>&1; then
@@ -143,13 +143,16 @@ jobs:
           echo "== Podsumowanie =="
           echo "Sukcesy: $success_count"
           echo "Niepowodzenia: $fail_count"
-
-          # Jeśli absolutnie nic się nie udało — oznacz błąd. W przeciwnym razie zostaw run jako success.
           if (( success_count == 0 )); then
             exit 255
           fi
 
-            - name: Upload artifacts (PDFs + logs)
+      - name: List outputs
+        run: |
+          echo "== output =="; ls -lah output || true
+          echo "== logs =="; ls -lah logs || true
+
+      - name: Upload artifacts (PDFs + logs)
         uses: actions/upload-artifact@v4
         with:
           name: converted-pdfs-and-logs
@@ -176,23 +179,15 @@ jobs:
             exit 0
           fi
 
-          # Git safety + identity
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Upewnij się, że jesteśmy na właściwej gałęzi
-          git fetch origin "$BRANCH"
+          git fetch origin "$BRANCH" || true
           git checkout -B "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout -B "$BRANCH"
 
-          # Dodaj i commitnij (nie kończ run’a, jeśli brak zmian)
-          git add output
-          git commit -m "Add converted PDFs ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)" || {
-            echo "No changes to commit."
-          }
+          git add output || true
+          git commit -m "Add converted PDFs ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)" || echo "No changes to commit."
 
-          # Spróbuj pushnąć – nie zabijaj joba, gdy gałąź jest chroniona itp.
           git pull --ff-only origin "$BRANCH" || echo "::warning ::Pull failed (ff-only). Continuing."
           git push origin "HEAD:$BRANCH" || echo "::warning ::Push failed (protected branch or permissions)."
-
-          fi
