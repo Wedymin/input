@@ -17,8 +17,10 @@ jobs:
         with:
           lfs: true
 
-      - name: Show repo tree & find PDFs
+      - name: Show repo tree & find PDFs (debug)
         run: |
+          echo "== Repo root =="
+          pwd
           echo "== Repo tree =="
           ls -lahR || true
           echo "== PDFs in input/ (any case) =="
@@ -30,16 +32,32 @@ jobs:
           sudo apt-get install -y ghostscript
           gs -v
 
-      - name: Convert PDFs to PDF 1.4
+      - name: Convert PDFs to PDF 1.4 (input/ or repo fallback)
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          mapfile -t files < <(find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print)
+
+          # 1) Zbierz pliki z input/
+          mapfile -t files < <(find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print 2>/dev/null || true)
+
+          # 2) Jeśli brak – skanuj całe repo (bez .git i bez output)
           if (( ${#files[@]} == 0 )); then
-            echo "ERROR: No PDFs found in input/"; exit 66
+            echo "No PDFs under input/. Falling back to scan the whole repo..."
+            mapfile -t files < <(find . -type f \( -iname "*.pdf" -o -iname "*.PDF" \) \
+                                   ! -path "./.git/*" ! -path "./output/*" -print)
           fi
+
+          # 3) Jeśli nadal brak – zakończ z czytelnym komunikatem
+          if (( ${#files[@]} == 0 )); then
+            echo "ERROR: No PDFs found anywhere in the repo."
+            echo "Tip: Upewnij się, że PDF jest w tej samej gałęzi, z której uruchamiasz workflow."
+            exit 66
+          fi
+
           mkdir -p output
+
+          # 4) Konwersja
           for f in "${files[@]}"; do
             base="$(basename "$f")"
             out="output/${base%.*}_PDF14.pdf"
