@@ -1,7 +1,12 @@
-name: Downgrade PDFs to PDF 1.4 (Acrobat 5+)
+name: PDF → PDF 1.4 (multi-engine & logs)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      path:
+        description: 'Opcjonalna ścieżka do jednego PDF-a (np. input/plik.pdf). Pusta = skanuj input/ potem całe repo.'
+        required: false
+        default: ''
   push:
     paths:
       - "input/**.pdf"
@@ -17,75 +22,107 @@ jobs:
         with:
           lfs: true
 
-      - name: Show repo tree & find PDFs (debug)
+      - name: Pokaż drzewo repo i PDF-y
         run: |
-          echo "== Repo root =="
-          pwd
-          echo "== Repo tree =="
-          ls -lahR || true
-          echo "== PDFs in input/ (any case) =="
-          find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print || true
+          echo "== CWD =="; pwd
+          echo "== Drzewo =="; ls -lahR || true
+          echo "== Szukam PDF-ów w input/ =="; find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print || true
 
-      - name: Install Ghostscript
+      - name: Zainstaluj narzędzia
         run: |
           sudo apt-get update
-          sudo apt-get install -y ghostscript
-          gs -v
+          sudo apt-get install -y ghostscript qpdf mupdf-tools poppler-utils
+          gs -v || true
+          qpdf --version || true
+          mutool -v || true
+          pdftocairo -v || true
 
-      - name: Convert PDFs to PDF 1.4 (input/ or repo fallback)
+      - name: Konwersja (GS → QPDF+GS → MuPDF+GS → Raster)
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
+          mkdir -p output logs
 
-          # 1) Zbierz pliki z input/
-          mapfile -t files < <(find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print 2>/dev/null || true)
-
-          # 2) Jeśli brak – skanuj całe repo (bez .git i bez output)
-          if (( ${#files[@]} == 0 )); then
-            echo "No PDFs under input/. Falling back to scan the whole repo..."
-            mapfile -t files < <(find . -type f \( -iname "*.pdf" -o -iname "*.PDF" \) \
-                                   ! -path "./.git/*" ! -path "./output/*" -print)
-          fi
-
-          # 3) Jeśli nadal brak – zakończ z czytelnym komunikatem
-          if (( ${#files[@]} == 0 )); then
-            echo "ERROR: No PDFs found anywhere in the repo."
-            echo "Tip: Upewnij się, że PDF jest w tej samej gałęzi, z której uruchamiasz workflow."
-            exit 66
-          fi
-
-          mkdir -p output
-
-          # 4) Konwersja
-          for f in "${files[@]}"; do
-            base="$(basename "$f")"
-            out="output/${base%.*}_PDF14.pdf"
-            echo "::group::Converting $f -> $out"
-            set -x
-            gs -sDEVICE=pdfwrite -dSAFER \
-               -dCompatibilityLevel=1.4 \
-               -dPDFSETTINGS=/prepress \
-               -dDetectDuplicateImages=true \
-               -dColorImageDownsampleType=/None \
-               -dGrayImageDownsampleType=/None \
-               -dMonoImageDownsampleType=/None \
-               -dEmbedAllFonts=true -dSubsetFonts=true \
-               -dNOPAUSE -dBATCH \
-               -sOutputFile="$out" "$f"
-            set +x
-            if [[ ! -s "$out" ]]; then
-              echo "ERROR: Conversion produced no file for $f"; exit 65
+          # Zbierz pliki do obróbki
+          declare -a files=()
+          if [[ -n "${{ github.event.inputs.path }}" ]]; then
+            files=( "${{ github.event.inputs.path }}" )
+          else
+            mapfile -t files < <(find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print 2>/dev/null || true)
+            if (( ${#files[@]} == 0 )); then
+              echo "Brak w input/. Skanuję całe repo (bez .git oraz output/)..."
+              mapfile -t files < <(find . -type f \( -iname "*.pdf" -o -iname "*.PDF" \) ! -path "./.git/*" ! -path "./output/*" -print)
             fi
-            echo "::endgroup::"
+          fi
+
+          if (( ${#files[@]} == 0 )); then
+            echo "ERROR: Nie znaleziono żadnych PDF-ów." ; exit 66
+          fi
+
+          fail_count=0
+
+          for f in "${files[@]}"; do
+            base="$(basename "$f")"; stem="${base%.*}"
+            out="output/${stem}_PDF14.pdf"
+            log="logs/${stem}.log"
+            echo "=== Przetwarzam: $f ===" | tee "$log"
+
+            # 1) Ghostscript minimalny
+            if gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -sOutputFile="$out" "$f" >>"$log" 2>&1; then
+              echo "OK: Ghostscript (minimalny)" | tee -a "$log"
+              continue
+            fi
+
+            # 2) qpdf naprawa → Ghostscript
+            tmp1="$(mktemp --suffix=.pdf)"
+            if qpdf --linearize "$f" "$tmp1" >>"$log" 2>&1 && \
+               gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -sOutputFile="$out" "$tmp1" >>"$log" 2>&1; then
+              echo "OK: qpdf + Ghostscript" | tee -a "$log"
+              rm -f "$tmp1"
+              continue
+            fi
+            rm -f "$tmp1" || true
+
+            # 3) MuPDF (mutool clean) → Ghostscript
+            tmp2="$(mktemp --suffix=.pdf)"
+            if mutool clean -gg -d "$f" "$tmp2" >>"$log" 2>&1 && \
+               gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -sOutputFile="$out" "$tmp2" >>"$log" 2>&1; then
+              echo "OK: MuPDF + Ghostscript" | tee -a "$log"
+              rm -f "$tmp2"
+              continue
+            fi
+            rm -f "$tmp2" || true
+
+            # 4) Fallback rastrowy (ostatnia deska ratunku)
+            out_raster="output/${stem}_RASTER_PDF14.pdf"
+            if pdftocairo -pdf -r 300 "$f" "output/${stem}_RASTER" >>"$log" 2>&1; then
+              mv "output/${stem}_RASTER.pdf" "$out_raster"
+              echo "OK: Raster fallback (pdftocairo 300 DPI)" | tee -a "$log"
+              continue
+            fi
+
+            echo "FAIL: wszystkie metody zawiodły dla $f (patrz $log)" | tee -a "$log"
+            ((fail_count++)) || true
           done
 
-      - name: List outputs
-        run: ls -lah output || true
+          if (( fail_count > 0 )); then
+            echo "Uwaga: niektóre pliki nie przeszły ($fail_count). Sprawdź folder logs/."
+            exit 255
+          fi
 
-      - name: Upload converted PDFs
+      - name: Lista wyników
+        run: |
+          echo "== output =="; ls -lah output || true
+          echo "== logs =="; ls -lah logs || true
+
+      - name: Artefakty (PDF-y + logi)
         uses: actions/upload-artifact@v4
         with:
-          name: converted-pdfs
-          path: output
-          if-no-files-found: error
+          name: converted-pdfs-and-logs
+          path: |
+            output
+            logs
+          if-no-files-found: warn
