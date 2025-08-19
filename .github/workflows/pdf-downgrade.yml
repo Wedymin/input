@@ -1,12 +1,27 @@
-name: PDF → PDF 1.4 (multi-engine & logs)
+name: PDF → PDF 1.4 (multi-engine, logs, autocommit)
+
+concurrency:
+  group: pdf-downgrade-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 on:
   workflow_dispatch:
     inputs:
       path:
-        description: 'Opcjonalna ścieżka do jednego PDF-a (np. input/plik.pdf). Pusta = skanuj input/ potem całe repo.'
+        description: 'Opcjonalna ścieżka do jednego PDF-a (np. input/plik.pdf). Pusta = skanuj input/, potem całe repo.'
         required: false
         default: ''
+      pdfsettings:
+        description: 'Profil Ghostscript: /prepress, /printer, /ebook, /screen'
+        required: false
+        default: '/prepress'
+      allow_raster_fallback:
+        description: 'Zezwól na fallback rastrowy (true/false)'
+        required: false
+        default: 'true'
   push:
     paths:
       - "input/**.pdf"
@@ -21,14 +36,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+          fetch-depth: 0
 
-      - name: Pokaż drzewo repo i PDF-y
+      - name: Show repo tree & find PDFs (debug)
         run: |
           echo "== CWD =="; pwd
-          echo "== Drzewo =="; ls -lahR || true
-          echo "== Szukam PDF-ów w input/ =="; find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print || true
+          echo "== Repo tree =="; ls -lahR || true
+          echo "== PDFs in input/ (any case) =="
+          find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print || true
 
-      - name: Zainstaluj narzędzia
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ghostscript qpdf mupdf-tools poppler-utils
@@ -37,13 +54,16 @@ jobs:
           mutool -v || true
           pdftocairo -v || true
 
-      - name: Konwersja (GS → QPDF+GS → MuPDF+GS → Raster)
+      - name: Convert PDFs (GS → QPDF+GS → MuPDF+GS → Raster)
         shell: bash
+        env:
+          PDFSETTINGS: ${{ github.event.inputs.pdfsettings || '/prepress' }}
+          ALLOW_RASTER: ${{ github.event.inputs.allow_raster_fallback || 'true' }}
         run: |
           set -euo pipefail
           mkdir -p output logs
 
-          # Zbierz pliki do obróbki
+          # Zbierz pliki wejściowe
           declare -a files=()
           if [[ -n "${{ github.event.inputs.path }}" ]]; then
             files=( "${{ github.event.inputs.path }}" )
@@ -59,6 +79,7 @@ jobs:
             echo "ERROR: Nie znaleziono żadnych PDF-ów." ; exit 66
           fi
 
+          success_count=0
           fail_count=0
 
           for f in "${files[@]}"; do
@@ -69,18 +90,22 @@ jobs:
 
             # 1) Ghostscript minimalny
             if gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -dPDFSETTINGS="${PDFSETTINGS}" \
                   -sOutputFile="$out" "$f" >>"$log" 2>&1; then
               echo "OK: Ghostscript (minimalny)" | tee -a "$log"
+              ((success_count++))
               continue
             fi
 
-            # 2) qpdf naprawa → Ghostscript
+            # 2) qpdf → Ghostscript
             tmp1="$(mktemp --suffix=.pdf)"
             if qpdf --linearize "$f" "$tmp1" >>"$log" 2>&1 && \
                gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -dPDFSETTINGS="${PDFSETTINGS}" \
                   -sOutputFile="$out" "$tmp1" >>"$log" 2>&1; then
               echo "OK: qpdf + Ghostscript" | tee -a "$log"
               rm -f "$tmp1"
+              ((success_count++))
               continue
             fi
             rm -f "$tmp1" || true
@@ -89,36 +114,47 @@ jobs:
             tmp2="$(mktemp --suffix=.pdf)"
             if mutool clean -gg -d "$f" "$tmp2" >>"$log" 2>&1 && \
                gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -dPDFSETTINGS="${PDFSETTINGS}" \
                   -sOutputFile="$out" "$tmp2" >>"$log" 2>&1; then
               echo "OK: MuPDF + Ghostscript" | tee -a "$log"
               rm -f "$tmp2"
+              ((success_count++))
               continue
             fi
             rm -f "$tmp2" || true
 
-            # 4) Fallback rastrowy (ostatnia deska ratunku)
-            out_raster="output/${stem}_RASTER_PDF14.pdf"
-            if pdftocairo -pdf -r 300 "$f" "output/${stem}_RASTER" >>"$log" 2>&1; then
-              mv "output/${stem}_RASTER.pdf" "$out_raster"
-              echo "OK: Raster fallback (pdftocairo 300 DPI)" | tee -a "$log"
-              continue
+            # 4) Fallback rastrowy (opcjonalny)
+            if [[ "${ALLOW_RASTER}" == "true" ]]; then
+              out_raster="output/${stem}_RASTER_PDF14.pdf"
+              if pdftocairo -pdf -r 300 "$f" "output/${stem}_RASTER" >>"$log" 2>&1; then
+                mv "output/${stem}_RASTER.pdf" "$out_raster"
+                echo "OK: Raster fallback (pdftocairo 300 DPI)" | tee -a "$log"
+                ((success_count++))
+                continue
+              fi
+            else
+              echo "Raster fallback wyłączony." | tee -a "$log"
             fi
 
             echo "FAIL: wszystkie metody zawiodły dla $f (patrz $log)" | tee -a "$log"
             ((fail_count++)) || true
           done
 
-          if (( fail_count > 0 )); then
-            echo "Uwaga: niektóre pliki nie przeszły ($fail_count). Sprawdź folder logs/."
+          echo "== Podsumowanie =="
+          echo "Sukcesy: $success_count"
+          echo "Niepowodzenia: $fail_count"
+
+          # Jeśli absolutnie nic się nie udało — oznacz błąd. W przeciwnym razie zostaw run jako success.
+          if (( success_count == 0 )); then
             exit 255
           fi
 
-      - name: Lista wyników
+      - name: List outputs
         run: |
           echo "== output =="; ls -lah output || true
           echo "== logs =="; ls -lah logs || true
 
-      - name: Artefakty (PDF-y + logi)
+      - name: Upload artifacts (PDFs + logs)
         uses: actions/upload-artifact@v4
         with:
           name: converted-pdfs-and-logs
@@ -126,3 +162,16 @@ jobs:
             output
             logs
           if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit & push outputs back to repo
+        if: success()
+        run: |
+          if [ -n "$(ls -A output 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add output
+            git commit -m "Add converted PDFs ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)" || exit 0
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push
+          fi
