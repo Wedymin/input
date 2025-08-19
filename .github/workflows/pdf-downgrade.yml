@@ -30,6 +30,7 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout (with LFS)
         uses: actions/checkout@v4
@@ -56,12 +57,16 @@ jobs:
       - name: Convert PDFs (GS → QPDF+GS → MuPDF+GS → Raster)
         shell: bash
         env:
-          PDFSETTINGS: ${{ github.event.inputs.pdfsettings && github.event.inputs.pdfsettings || '/prepress' }}
-          ALLOW_RASTER: ${{ github.event.inputs.allow_raster_fallback && github.event.inputs.allow_raster_fallback || 'true' }}
-          INPUT_PATH: ${{ github.event.inputs.path && github.event.inputs.path || '' }}
+          PDFSETTINGS: ${{ github.event.inputs.pdfsettings || '/prepress' }}
+          ALLOW_RASTER: ${{ github.event.inputs.allow_raster_fallback || 'true' }}
+          INPUT_PATH: ${{ github.event.inputs.path || '' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail    # bez -e, żeby nie przerywać całego kroku na 1 błędzie
           mkdir -p output logs
+
+          echo "PDFSETTINGS=${PDFSETTINGS}"
+          echo "ALLOW_RASTER=${ALLOW_RASTER}"
+          echo "INPUT_PATH=${INPUT_PATH}"
 
           # Zbierz pliki wejściowe
           declare -a files=()
@@ -76,52 +81,59 @@ jobs:
           fi
 
           if (( ${#files[@]} == 0 )); then
-            echo "ERROR: Nie znaleziono żadnych PDF-ów." ; exit 66
+            echo "ERROR: Nie znaleziono żadnych PDF-ów."
+            exit 66
           fi
 
           success_count=0
           fail_count=0
 
-          for f in "${files[@]}"; do
+          convert_one() {
+            local f="$1"
+            local base stem out log tmp1 tmp2 out_raster
             base="$(basename "$f")"; stem="${base%.*}"
             out="output/${stem}_PDF14.pdf"
             log="logs/${stem}.log"
+
             echo "=== Przetwarzam: $f ===" | tee "$log"
 
             # 1) Ghostscript
             if gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
                   -dPDFSETTINGS="${PDFSETTINGS}" \
                   -sOutputFile="$out" "$f" >>"$log" 2>&1; then
-              echo "OK: Ghostscript (minimalny)" | tee -a "$log"
-              ((success_count++))
-              continue
+              echo "OK: Ghostscript" | tee -a "$log"
+              return 0
+            else
+              echo "GS (bezpośrednio) nie powiodło się." | tee -a "$log"
             fi
 
             # 2) qpdf → Ghostscript
-            tmp1="$(mktemp --suffix=.pdf)"
+            tmp1="$(mktemp --suffix=.pdf)" || tmp1="$(mktemp)"
             if qpdf --linearize "$f" "$tmp1" >>"$log" 2>&1 && \
                gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
                   -dPDFSETTINGS="${PDFSETTINGS}" \
                   -sOutputFile="$out" "$tmp1" >>"$log" 2>&1; then
-              echo "OK: qpdf + Ghostscript" | tee -a "$log"
+              echo "OK: qpdf + GS" | tee -a "$log"
               rm -f "$tmp1"
-              ((success_count++))
-              continue
+              return 0
+            else
+              echo "qpdf+GS nie powiodło się." | tee -a "$log"
+              rm -f "$tmp1" || true
             fi
-            rm -f "$tmp1" || true
 
             # 3) MuPDF (mutool clean) → Ghostscript
-            tmp2="$(mktemp --suffix=.pdf)"
+            tmp2="$(mktemp --suffix=.pdf)" || tmp2="$(mktemp)"
             if mutool clean -gg -d "$f" "$tmp2" >>"$log" 2>&1 && \
                gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
                   -dPDFSETTINGS="${PDFSETTINGS}" \
                   -sOutputFile="$out" "$tmp2" >>"$log" 2>&1; then
-              echo "OK: MuPDF + Ghostscript" | tee -a "$log"
+              echo "OK: MuPDF + GS" | tee -a "$log"
               rm -f "$tmp2"
-              ((success_count++))
-              continue
+              return 0
+            else
+              echo "MuPDF+GS nie powiodło się." | tee -a "$log"
+              rm -f "$tmp2" || true
             fi
-            rm -f "$tmp2" || true
 
             # 4) Raster fallback (opcjonalny)
             if [[ "${ALLOW_RASTER}" == "true" ]]; then
@@ -129,22 +141,34 @@ jobs:
               if pdftocairo -pdf -r 300 "$f" "output/${stem}_RASTER" >>"$log" 2>&1; then
                 mv "output/${stem}_RASTER.pdf" "$out_raster"
                 echo "OK: Raster fallback (pdftocairo 300 DPI)" | tee -a "$log"
-                ((success_count++))
-                continue
+                return 0
+              else
+                echo "Raster fallback nie powiódł się." | tee -a "$log"
               fi
             else
               echo "Raster fallback wyłączony." | tee -a "$log"
             fi
 
-            echo "FAIL: wszystkie metody zawiodły dla $f (patrz $log)" | tee -a "$log"
-            ((fail_count++)) || true
+            echo "FAIL: wszystkie metody zawiodły dla $f" | tee -a "$log"
+            return 1
+          }
+
+          # Pętla po plikach — kontynuujemy mimo błędów
+          for f in "${files[@]}"; do
+            if convert_one "$f"; then
+              ((success_count++))
+            else
+              ((fail_count++))
+            fi
           done
 
           echo "== Podsumowanie =="
           echo "Sukcesy: $success_count"
           echo "Niepowodzenia: $fail_count"
+
+          # Jeśli absolutnie żaden się nie udał — sygnalizuj błąd
           if (( success_count == 0 )); then
-            exit 255
+            exit 1
           fi
 
       - name: List outputs
