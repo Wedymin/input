@@ -149,12 +149,7 @@ jobs:
             exit 255
           fi
 
-      - name: List outputs
-        run: |
-          echo "== output =="; ls -lah output || true
-          echo "== logs =="; ls -lah logs || true
-
-      - name: Upload artifacts (PDFs + logs)
+            - name: Upload artifacts (PDFs + logs)
         uses: actions/upload-artifact@v4
         with:
           name: converted-pdfs-and-logs
@@ -164,14 +159,40 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Commit & push outputs back to repo
-        if: success()
+      - name: Determine target branch
+        id: branch
         run: |
-          if [ -n "$(ls -A output 2>/dev/null)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add output
-            git commit -m "Add converted PDFs ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)" || exit 0
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push
+          echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}" >> "$GITHUB_OUTPUT"
+          echo "Using branch: ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+
+      - name: Commit & push outputs back to repo (robust)
+        if: success()
+        continue-on-error: true
+        env:
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          if [ -z "$(ls -A output 2>/dev/null)" ]; then
+            echo "No files in output/, nothing to commit."
+            exit 0
+          fi
+
+          # Git safety + identity
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Upewnij się, że jesteśmy na właściwej gałęzi
+          git fetch origin "$BRANCH"
+          git checkout -B "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout -B "$BRANCH"
+
+          # Dodaj i commitnij (nie kończ run’a, jeśli brak zmian)
+          git add output
+          git commit -m "Add converted PDFs ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)" || {
+            echo "No changes to commit."
+          }
+
+          # Spróbuj pushnąć – nie zabijaj joba, gdy gałąź jest chroniona itp.
+          git pull --ff-only origin "$BRANCH" || echo "::warning ::Pull failed (ff-only). Continuing."
+          git push origin "HEAD:$BRANCH" || echo "::warning ::Push failed (protected branch or permissions)."
+
           fi
