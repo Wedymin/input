@@ -41,4 +41,263 @@ jobs:
           lfs: true
           fetch-depth: 0
 
-      - name: Show repo tree &
+      - name: Show repo tree & find PDFs (debug)
+        run: |
+          echo "== CWD =="; pwd
+          echo "== Repo tree =="; ls -lahR || true
+          echo "== PDFs in input/ (any case) =="
+          find input -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print || true
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ghostscript qpdf mupdf-tools poppler-utils imagemagick zip
+          gs -v || true
+          qpdf --version || true
+          mutool -v || true
+          pdftocairo -v || true
+          convert -version || true
+
+      - name: Convert PDFs (GS → QPDF+GS → MuPDF+GS → MuPDF convert → Raster → ImageMagick)
+        shell: bash
+        env:
+          PDFSETTINGS: ${{ github.event.inputs.pdfsettings || '/prepress' }}
+          ALLOW_RASTER: ${{ github.event.inputs.allow_raster_fallback || 'true' }}
+          INPUT_PATH: ${{ github.event.inputs.path || '' }}
+          RASTER_DPI: ${{ github.event.inputs.raster_dpi || '300' }}
+        run: |
+          set -uo pipefail    # bez -e: nie zrywamy pętli na 1 błędzie
+
+          ROOT="$GITHUB_WORKSPACE"
+          OUTDIR="$ROOT/output"
+          LOGDIR="$ROOT/logs"
+          mkdir -p "$OUTDIR" "$LOGDIR"
+
+          echo "PDFSETTINGS=${PDFSETTINGS}"
+          echo "ALLOW_RASTER=${ALLOW_RASTER}"
+          echo "INPUT_PATH=${INPUT_PATH}"
+          echo "RASTER_DPI=${RASTER_DPI}"
+          echo "ROOT=$ROOT"
+          echo "OUTDIR=$OUTDIR"
+          echo "LOGDIR=$LOGDIR"
+
+          # Zbierz pliki wejściowe
+          declare -a files=()
+          if [[ -n "$INPUT_PATH" ]]; then
+            files=( "$INPUT_PATH" )
+          else
+            mapfile -t files < <(find "$ROOT/input" -type f \( -iname "*.pdf" -o -iname "*.PDF" \) -print 2>/dev/null || true)
+            if (( ${#files[@]} == 0 )); then
+              echo "Brak w input/. Skanuję całe repo (bez .git oraz output/)..."
+              mapfile -t files < <(find "$ROOT" -type f \( -iname "*.pdf" -o -iname "*.PDF" \) ! -path "$ROOT/.git/*" ! -path "$OUTDIR/*" -print)
+            fi
+          fi
+
+          if (( ${#files[@]} == 0 )); then
+            echo "ERROR: Nie znaleziono żadnych PDF-ów."
+            exit 66
+          fi
+
+          success_count=0
+          fail_count=0
+
+          have_file() { [[ -s "$1" ]]; }
+
+          convert_one() {
+            local f="$1"
+            local base stem out out_raster out_im log tmp1 tmp2 tmp3
+            base="$(basename "$f")"; stem="${base%.*}"
+            out="$OUTDIR/${stem}_PDF14.pdf"
+            out_raster="$OUTDIR/${stem}_RASTER_PDF14.pdf"
+            out_im="$OUTDIR/${stem}_IMAGEMAGICK_PDF14.pdf"
+            log="$LOGDIR/${stem}.log"
+
+            echo "=== Przetwarzam: $f ===" | tee "$log"
+            echo "Wyjścia: $out | $out_raster | $out_im" | tee -a "$log"
+
+            # 1) Ghostscript (bezpośrednio)
+            if gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -dPDFSETTINGS="${PDFSETTINGS}" \
+                  -sOutputFile="$out" "$f" >>"$log" 2>&1; then
+              if have_file "$out"; then
+                echo "OK: Ghostscript → $out" | tee -a "$log"
+                return 0
+              else
+                echo "WARN: GS success, ale pliku $out brak." | tee -a "$log"
+              fi
+            else
+              echo "GS (bezpośrednio) nie powiodło się." | tee -a "$log"
+            fi
+
+            # 2) qpdf → Ghostscript
+            tmp1="$(mktemp --suffix=.pdf)" || tmp1="$(mktemp)"
+            if qpdf --linearize "$f" "$tmp1" >>"$log" 2>&1 && \
+               gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -dPDFSETTINGS="${PDFSETTINGS}" \
+                  -sOutputFile="$out" "$tmp1" >>"$log" 2>&1; then
+              rm -f "$tmp1"
+              if have_file "$out"; then
+                echo "OK: qpdf + GS → $out" | tee -a "$log"
+                return 0
+              else
+                echo "WARN: qpdf+GS success, ale pliku $out brak." | tee -a "$log"
+              fi
+            else
+              echo "qpdf+GS nie powiodło się." | tee -a "$log"
+              rm -f "$tmp1" || true
+            fi
+
+            # 3) MuPDF (mutool clean) → Ghostscript
+            tmp2="$(mktemp --suffix=.pdf)" || tmp2="$(mktemp)"
+            if mutool clean -gg -d "$f" "$tmp2" >>"$log" 2>&1 && \
+               gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                  -dPDFSETTINGS="${PDFSETTINGS}" \
+                  -sOutputFile="$out" "$tmp2" >>"$log" 2>&1; then
+              rm -f "$tmp2"
+              if have_file "$out"; then
+                echo "OK: MuPDF + GS → $out" | tee -a "$log"
+                return 0
+              else
+                echo "WARN: MuPDF+GS success, ale pliku $out brak." | tee -a "$log"
+              fi
+            else
+              echo "MuPDF+GS nie powiodło się." | tee -a "$log"
+              rm -f "$tmp2" || true
+            fi
+
+            # 4) MuPDF convert (bez GS): przepakowanie do nowego PDF
+            tmp3="$(mktemp --suffix=.pdf)" || tmp3="$(mktemp)"
+            if mutool convert -o "$tmp3" -F pdf "$f" >>"$log" 2>&1; then
+              # spróbuj jeszcze "dowieźć" do 1.4 Ghostscriptem
+              if gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH \
+                    -dPDFSETTINGS="${PDFSETTINGS}" \
+                    -sOutputFile="$out" "$tmp3" >>"$log" 2>&1; then
+                rm -f "$tmp3"
+                if have_file "$out"; then
+                  echo "OK: MuPDF convert → GS → $out" | tee -a "$log"
+                  return 0
+                fi
+              fi
+              # gdyby GS padł, weź czysty wynik MuPDF
+              mv -f "$tmp3" "$out"
+              if have_file "$out"; then
+                echo "OK: MuPDF convert (bez GS) → $out" | tee -a "$log"
+                return 0
+              else
+                echo "WARN: MuPDF convert success, ale pliku $out brak." | tee -a "$log"
+              fi
+            else
+              echo "MuPDF convert nie powiódł się." | tee -a "$log"
+              rm -f "$tmp3" || true
+            fi
+
+            # 5) Raster fallback (pdftocairo)
+            if [[ "${ALLOW_RASTER}" == "true" ]]; then
+              if pdftocairo -pdf -r "${RASTER_DPI}" "$f" "$OUTDIR/${stem}_RASTER" >>"$log" 2>&1; then
+                if have_file "$out_raster"; then
+                  echo "OK: Raster fallback (pdftocairo ${RASTER_DPI} DPI) → $out_raster" | tee -a "$log"
+                  return 0
+                else
+                  echo "WARN: pdftocairo success, ale pliku $out_raster brak." | tee -a "$log"
+                fi
+              else
+                echo "Raster fallback (pdftocairo) nie powiódł się." | tee -a "$log"
+              fi
+            else
+              echo "Raster fallback wyłączony." | tee -a "$log"
+            fi
+
+            # 6) Ostateczny fallback: ImageMagick
+            if convert -density "${RASTER_DPI}" "$f" -units PixelsPerInch -compress Zip "$out_im" >>"$log" 2>&1; then
+              if have_file "$out_im"; then
+                echo "OK: ImageMagick fallback (${RASTER_DPI} DPI) → $out_im" | tee -a "$log"
+                return 0
+              else
+                echo "WARN: ImageMagick success, ale pliku $out_im brak." | tee -a "$log"
+              fi
+            else
+              echo "ImageMagick fallback nie powiódł się." | tee -a "$log"
+            fi
+
+            echo "FAIL: wszystkie metody zawiodły dla $f" | tee -a "$log"
+            return 1
+          }
+
+          # Pętla po plikach — kontynuujemy mimo błędów
+          for f in "${files[@]}"; do
+            if convert_one "$f"; then
+              ((success_count++))
+            else
+              ((fail_count++))
+            fi
+          done
+
+          echo "== Podsumowanie =="
+          echo "Sukcesy: $success_count"
+          echo "Niepowodzenia: $fail_count"
+
+          # Jeżeli przynajmniej 1 plik się udał — sukces kroku
+          if (( success_count == 0 )); then
+            exit 1
+          fi
+
+      - name: Sanity report (workspace snapshot)
+        if: always()
+        run: |
+          echo "== PWD =="; pwd
+          echo "== ls -lah =="
+          ls -lah
+          echo "== find output & logs =="
+          find output -maxdepth 2 -type f -print 2>/dev/null || true
+          find logs -maxdepth 2 -type f -print 2>/dev/null || true
+          echo "== Disk usage =="
+          du -h --max-depth=1 || true
+
+      - name: Upload artifacts (PDFs + logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: converted-pdfs-and-logs
+          path: |
+            output
+            logs
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload full workspace (diagnostic)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-snapshot
+          path: .
+          retention-days: 3
+
+      - name: Determine target branch
+        id: branch
+        run: |
+          echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}" >> "$GITHUB_OUTPUT"
+          echo "Using branch: ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+
+      - name: Commit & push outputs back to repo (robust)
+        if: success()
+        continue-on-error: true
+        env:
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          if [ -z "$(ls -A output 2>/dev/null)" ]; then
+            echo "No files in output/, nothing to commit."
+            exit 0
+          fi
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin "$BRANCH" || true
+          git checkout -B "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout -B "$BRANCH"
+
+          git add output || true
+          git commit -m "Add converted PDFs ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)" || echo "No changes to commit."
+
+          git pull --ff-only origin "$BRANCH" || echo "::warning ::Pull failed (ff-only). Continuing."
+          git push origin "HEAD:$BRANCH" || echo "::warning ::Push failed (protected branch or permissions)."
